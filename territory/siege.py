@@ -1,5 +1,10 @@
-"""领地战与攻城系统 - 含8个bug"""
+"""领地战与攻城系统"""
 from dataclasses import dataclass, field
+
+MIN_RESPAWN_DISTANCE = 10.0   # 复活点离城墙的最短距离
+TAX_MIN, TAX_MAX = 0.05, 0.30  # 税率上下限
+LAST_HIT_WEIGHT = 0.05        # 最后一击的少量权重
+GUARDS_PER_LEVEL = 5          # 每级领地允许的守卫数
 
 @dataclass
 class Gate:
@@ -16,54 +21,76 @@ class SiegeEngine:
 
 class Siege:
     def __init__(self):
-        self.attacker_spawn_distance: float = 5.0  # bug1: 太近
+        self.attacker_spawn_distance: float = 20.0
+        self.front_line_advance: float = 0.0  # 战线推进距离
         self.gates: dict[str, Gate] = {"left": Gate("left", 100, 100), "right": Gate("right", 100, 100)}
-        self.total_gate_hp: float = 200  # bug2: 不区分左右扇
         self.tax_rate: float = 0.2
         self.guards: list = []
-        self.max_guards: int = 0  # bug6: 无上限
+        self.max_guards: int = 0  # 0表示按领地等级计算
+        self.territory_level: int = 1
         self.flag_progress: float = 0.0
-        self.flag_decay_rate: float = 0.0  # bug7: 不回退
+        self.flag_decay_rate: float = 1.0
         self.battle_end_time: float = 0
         self.players_in_battle: set = set()
         self.damage_log: dict[str, float] = {}  # guild -> total damage
+        self.last_hit_guild: str = ""
 
     def get_respawn_point(self, attacker_pos: tuple) -> tuple:
-        # bug1: 复活点离城墙太近
-        return (attacker_pos[0] + 3, attacker_pos[1])  # 只加3码
+        # 复活点有最短距离限制，随战线推进而前移
+        distance = max(MIN_RESPAWN_DISTANCE,
+                       self.attacker_spawn_distance - self.front_line_advance)
+        return (attacker_pos[0] + distance, attacker_pos[1])
 
     def damage_gate(self, side: str, dmg: float):
-        # bug2: 打一边两边都开
-        self.total_gate_hp -= dmg
-        if self.total_gate_hp <= 0:
-            self.gates["left"].open = True
-            self.gates["right"].open = True
+        # 左右扇独立计算血量，只开被打烂的那一侧
+        gate = self.gates[side]
+        gate.hp = max(0.0, gate.hp - dmg)
+        if gate.hp <= 0:
+            gate.open = True
 
     def set_tax(self, rate: float):
-        # bug3: 税率无上限
-        self.tax_rate = rate
+        # 税率限制在5%-30%
+        self.tax_rate = max(TAX_MIN, min(TAX_MAX, rate))
 
     def siege_engine_damage(self, engine: SiegeEngine, target: str) -> float:
-        # bug4: 对玩家也造成伤害
+        # 攻城器械只对建筑和NPC造成伤害，对玩家无效
+        if target == "player":
+            return 0.0
         return engine.damage
 
+    def record_damage(self, guild: str, dmg: float, is_last_hit: bool = False):
+        self.damage_log[guild] = self.damage_log.get(guild, 0.0) + dmg
+        if is_last_hit:
+            self.last_hit_guild = guild
+
     def calculate_ownership(self) -> str:
-        # bug5: 只看最后一击
+        # 按伤害总量占比判定，最后一击只加少量权重
         if not self.damage_log:
             return ""
-        return max(self.damage_log, key=self.damage_log.get)
+        total = sum(self.damage_log.values())
+        def score(guild: str) -> float:
+            s = self.damage_log[guild] / total if total > 0 else 0.0
+            if guild == self.last_hit_guild:
+                s += LAST_HIT_WEIGHT
+            return s
+        return max(self.damage_log, key=score)
 
     def add_guard(self, guard):
-        # bug6: 守卫数量无上限
+        # 守卫数量有上限，与领地等级挂钩
+        cap = self.max_guards if self.max_guards > 0 else self.territory_level * GUARDS_PER_LEVEL
+        if cap > 0 and len(self.guards) >= cap:
+            return False
         self.guards.append(guard)
+        return True
 
     def update_flag(self, attacker_present: bool, dt: float):
-        # bug7: 进攻方离开后不回退
         if attacker_present:
             self.flag_progress += dt
-        # 没有else回退
+        else:
+            # 进攻方离开后按速率回退
+            self.flag_progress = max(0.0, self.flag_progress - self.flag_decay_rate * dt)
 
     def end_battle(self):
-        # bug8: 结束后不强制传送玩家
+        # 结束时间到后强制结算并传送所有玩家出战场
         self.battle_end_time = 0
-        # players_in_battle没清空
+        self.players_in_battle.clear()
